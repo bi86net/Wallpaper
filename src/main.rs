@@ -3,6 +3,7 @@ mod rotation;
 mod service;
 mod settings;
 mod ui;
+mod used;
 use eframe::egui;
 use std::sync::mpsc::{self, Receiver, Sender};
 

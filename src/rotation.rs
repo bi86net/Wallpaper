@@ -1,4 +1,5 @@
 use crate::service::{self, Category, Wallpaper};
+use crate::used::Used;
 use rand::{Rng, seq::SliceRandom};
 use std::{
     collections::VecDeque,
@@ -21,6 +22,7 @@ pub enum Command {
     Configure(Schedule),
     Previous,
     Next,
+    AutoNext,
 }
 #[derive(Default)]
 struct History {
@@ -65,30 +67,37 @@ impl Feed {
             items: Vec::new(),
         }
     }
-    fn prepare(&mut self, history: &History, random: bool) -> anyhow::Result<PathBuf> {
-        if self.index >= self.items.len() {
-            let response =
-                service::search(self.category, if random { 1 } else { self.page }, random)?;
+    fn unseen(
+        &mut self,
+        used: &Used,
+        random: bool,
+        mut search: impl FnMut(Category, u32, bool) -> anyhow::Result<service::Page>,
+    ) -> anyhow::Result<Option<Wallpaper>> {
+        let mut requests = 0;
+        loop {
+            while self.index < self.items.len() {
+                if !used.contains(&self.items[self.index].id) {
+                    return Ok(Some(self.items[self.index].clone()));
+                }
+                self.advance();
+            }
+            // Bound each attempt to avoid endless requests when a category is exhausted.
+            if requests >= 5 {
+                return Ok(None);
+            }
+            let response = search(self.category, if random { 1 } else { self.page }, random)?;
+            requests += 1;
             self.items = response.data;
             if random {
                 self.items.shuffle(&mut rand::thread_rng());
             }
             self.last_page = response.meta.last_page.max(1);
             self.index = 0;
-            anyhow::ensure!(
-                !self.items.is_empty(),
-                "{}分类没有可用的 4K 壁纸",
-                self.category.label()
-            );
-        }
-        loop {
-            let path = service::download(&self.items[self.index])?;
-            if history.position.is_some_and(|p| history.paths[p] == path)
-                && self.index + 1 < self.items.len()
-            {
-                self.index += 1;
-            } else {
-                return Ok(path);
+            if self.items.is_empty() {
+                if random {
+                    continue;
+                }
+                return Ok(None);
             }
         }
     }
@@ -141,6 +150,7 @@ pub fn start(events: Sender<crate::Event>, ctx: eframe::egui::Context) -> Sender
         };
         let mut feeds = Feeds::new(&schedule.categories);
         let mut history = History::default();
+        let mut used = Used::open();
         let mut pending = VecDeque::new();
         loop {
             let command = if let Some(c) = pending.pop_front() {
@@ -153,7 +163,7 @@ pub fn start(events: Sender<crate::Event>, ctx: eframe::egui::Context) -> Sender
                 };
                 match received {
                     Ok(c) => c,
-                    Err(mpsc::RecvTimeoutError::Timeout) => Command::Next,
+                    Err(mpsc::RecvTimeoutError::Timeout) => Command::AutoNext,
                     Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 }
             };
@@ -169,6 +179,7 @@ pub fn start(events: Sender<crate::Event>, ctx: eframe::egui::Context) -> Sender
             ctx.request_repaint();
             let mut target = None;
             let mut advance = false;
+            let mut selected_id = None;
             let result = (|| -> anyhow::Result<PathBuf> {
                 match command {
                     Command::Previous => {
@@ -178,16 +189,35 @@ pub fn start(events: Sender<crate::Event>, ctx: eframe::egui::Context) -> Sender
                         target = Some(p);
                         Ok(history.paths[p].clone())
                     }
-                    Command::Next => {
-                        if let Some(p) = history.next() {
+                    Command::Next | Command::AutoNext => {
+                        if matches!(command, Command::Next)
+                            && let Some(p) = history.next()
+                        {
                             target = Some(p);
                             return Ok(history.paths[p].clone());
                         }
+                        if used.is_err() {
+                            used = Used::open();
+                        }
+                        let records = used
+                            .as_ref()
+                            .map_err(|e| anyhow::anyhow!("无法读取使用记录：{e:#}"))?;
                         feeds.choose(&mut rand::thread_rng());
                         let random = feeds.items.len() > 1;
-                        let path = feeds.items[feeds.next].prepare(&history, random)?;
-                        advance = true;
-                        Ok(path)
+                        for _ in 0..feeds.items.len() {
+                            if let Some(item) =
+                                feeds.items[feeds.next].unseen(records, random, service::search)?
+                            {
+                                let path = service::download(&item)?;
+                                selected_id = Some(item.id);
+                                advance = true;
+                                return Ok(path);
+                            }
+                            feeds.next = (feeds.next + 1) % feeds.items.len();
+                        }
+                        anyhow::bail!(
+                            "本次未找到未使用的壁纸，已保留当前桌面，请稍后重试或更换分类"
+                        )
                     }
                     Command::Configure(_) => unreachable!(),
                 }
@@ -211,6 +241,14 @@ pub fn start(events: Sender<crate::Event>, ctx: eframe::egui::Context) -> Sender
                         if advance {
                             feeds.advance();
                         }
+                        if let Some(id) = selected_id {
+                            used.as_mut()
+                                .map_err(|e| anyhow::anyhow!("{e:#}"))?
+                                .record(id)
+                                .map_err(|e| {
+                                    anyhow::anyhow!("壁纸已更换，但使用记录保存失败：{e:#}")
+                                })?;
+                        }
                         Ok(format!("已更换壁纸：{}", path.display()))
                     })
                     .map_err(|e| format!("更换失败：{e:#}"))
@@ -229,6 +267,55 @@ pub fn start(events: Sender<crate::Event>, ctx: eframe::egui::Context) -> Sender
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn sample(id: &str) -> Wallpaper {
+        Wallpaper {
+            id: id.into(),
+            path: String::new(),
+            dimension_x: 3840,
+            dimension_y: 2160,
+        }
+    }
+    #[test]
+    fn skips_used_ids_across_pages_without_marking_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut used = Used::load(dir.path().join("used.json")).unwrap();
+        used.record("old".into()).unwrap();
+        let mut feed = Feed::new(Category::Landscape);
+        let mut pages = Vec::new();
+        let candidate = feed
+            .unseen(&used, false, |_, page, _| {
+                pages.push(page);
+                Ok(service::Page {
+                    data: vec![sample(if page == 1 { "old" } else { "new" })],
+                    meta: service::Meta { last_page: 2 },
+                })
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.id, "new");
+        assert_eq!(pages, vec![1, 2]);
+        assert!(!used.contains("new"));
+        assert_eq!(feed.index, 0);
+    }
+    #[test]
+    fn exhausted_random_results_stop_without_reusing_old_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut used = Used::load(dir.path().join("used.json")).unwrap();
+        used.record("old".into()).unwrap();
+        let mut feed = Feed::new(Category::Beauty);
+        let mut calls = 0;
+        let candidate = feed
+            .unseen(&used, true, |_, _, _| {
+                calls += 1;
+                Ok(service::Page {
+                    data: vec![sample("old")],
+                    meta: service::Meta { last_page: 1 },
+                })
+            })
+            .unwrap();
+        assert!(candidate.is_none());
+        assert_eq!(calls, 5);
+    }
     #[test]
     fn multiple_categories_are_random_instead_of_alternating() {
         use rand::SeedableRng;
