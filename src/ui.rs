@@ -310,7 +310,7 @@ impl App {
                             });
                         }
                         ui.horizontal(|ui| {
-                            hint(ui, "Wallhaven · SFW");
+                            hint(ui, "Wallhaven · Commons · Bing");
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {

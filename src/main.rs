@@ -2,6 +2,7 @@
 mod rotation;
 mod service;
 mod settings;
+mod sources;
 mod ui;
 mod used;
 use eframe::egui;

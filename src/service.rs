@@ -50,9 +50,23 @@ fn client() -> Result<reqwest::blocking::Client> {
         .build()?)
 }
 pub fn search(category: Category, page: u32, random: bool) -> Result<Page> {
+    crate::sources::search(category, page, random)
+}
+fn allowed_image_url(url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+        && url.host_str().is_some_and(|host| {
+            host == "wallhaven.cc"
+                || host.ends_with(".wallhaven.cc")
+                || host == "upload.wikimedia.org"
+                || host == "www.bing.com"
+                || host == "cn.bing.com"
+        })
+}
+pub fn wallhaven_search(category: Category, page: u32, random: bool) -> Result<Page> {
     let (q, categories) = category.query();
     let mut result: Page = client()?
         .get("https://wallhaven.cc/api/v1/search")
+        .timeout(Duration::from_secs(15))
         .query(&[
             ("q", q),
             ("categories", categories),
@@ -74,21 +88,25 @@ pub fn search(category: Category, page: u32, random: bool) -> Result<Page> {
 }
 pub fn download(w: &Wallpaper) -> Result<PathBuf> {
     ensure!(
-        !w.id.is_empty() && w.id.chars().all(|c| c.is_ascii_alphanumeric()),
+        !w.id.is_empty() && w.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
         "无效的壁纸编号"
     );
     let url = reqwest::Url::parse(&w.path)?;
-    ensure!(
-        url.scheme() == "https"
-            && url
-                .host_str()
-                .is_some_and(|h| h == "wallhaven.cc" || h.ends_with(".wallhaven.cc")),
-        "无效的图片地址"
-    );
-    let ext = match url.path().rsplit('.').next() {
-        Some("png") => "png",
-        Some("webp") => "webp",
-        Some("jpg" | "jpeg") => "jpg",
+    ensure!(allowed_image_url(&url), "无效的图片地址");
+    let extension_path = if w.id.starts_with("bing-") {
+        "image.jpg"
+    } else {
+        url.path()
+    };
+    let extension = extension_path
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let ext = match extension.as_str() {
+        "png" => "png",
+        "webp" => "webp",
+        "jpg" | "jpeg" => "jpg",
         _ => anyhow::bail!("不支持的图片格式"),
     };
     let folder = dirs::picture_dir()
@@ -96,7 +114,12 @@ pub fn download(w: &Wallpaper) -> Result<PathBuf> {
         .context("找不到图片目录")?
         .join("Wallpaper");
     std::fs::create_dir_all(&folder)?;
-    let path = folder.join(format!("wallhaven-{}.{}", w.id, ext));
+    let path = folder.join(format!(
+        "{}{}.{}",
+        if w.id.contains('-') { "" } else { "wallhaven-" },
+        w.id,
+        ext
+    ));
     if let Ok(bytes) = std::fs::read(&path)
         && validate(&bytes).is_ok()
     {
@@ -119,7 +142,7 @@ fn save_image(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     temp.persist(path)?;
     Ok(())
 }
-fn validate(bytes: &[u8]) -> Result<()> {
+pub(crate) fn validate(bytes: &[u8]) -> Result<()> {
     let reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
     let (width, height) = reader.into_dimensions().context("下载内容不是有效图片")?;
     ensure!(width >= 3840 && height >= 2160, "图片实际分辨率不足 4K");
@@ -133,6 +156,23 @@ fn validate(bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_trusted_source_image_hosts_are_allowed() {
+        for url in [
+            "https://w.wallhaven.cc/full/a.jpg",
+            "https://upload.wikimedia.org/a.jpg",
+            "https://www.bing.com/th?id=OHR.Test_UHD.jpg",
+        ] {
+            assert!(allowed_image_url(&reqwest::Url::parse(url).unwrap()));
+        }
+        for url in [
+            "http://www.bing.com/a.jpg",
+            "https://upload.wikimedia.org.evil.example/a.jpg",
+            "https://example.com/a.jpg",
+        ] {
+            assert!(!allowed_image_url(&reqwest::Url::parse(url).unwrap()));
+        }
+    }
     #[test]
     fn concurrent_saves_do_not_share_temporary_files() {
         let dir = tempfile::tempdir().unwrap();

@@ -5,6 +5,7 @@ if [ "$(uname -s)" != "Darwin" ]; then
     echo 'This script requires macOS.' >&2
     exit 1
 fi
+./scripts/update-version.sh
 profile=debug
 if [ "${1:-}" = "--release" ]; then
     profile=release

@@ -204,19 +204,38 @@ pub fn start(events: Sender<crate::Event>, ctx: eframe::egui::Context) -> Sender
                             .map_err(|e| anyhow::anyhow!("无法读取使用记录：{e:#}"))?;
                         feeds.choose(&mut rand::thread_rng());
                         let random = feeds.items.len() > 1;
+                        let mut errors = Vec::new();
                         for _ in 0..feeds.items.len() {
-                            if let Some(item) =
-                                feeds.items[feeds.next].unseen(records, random, service::search)?
-                            {
-                                let path = service::download(&item)?;
-                                selected_id = Some(item.id);
-                                advance = true;
-                                return Ok(path);
+                            // A bad source image must not permanently block the feed.
+                            for _ in 0..6 {
+                                match feeds.items[feeds.next].unseen(
+                                    records,
+                                    random,
+                                    service::search,
+                                ) {
+                                    Ok(Some(item)) => match service::download(&item) {
+                                        Ok(path) => {
+                                            selected_id = Some(item.id);
+                                            advance = true;
+                                            return Ok(path);
+                                        }
+                                        Err(e) => {
+                                            errors.push(format!("{e:#}"));
+                                            feeds.advance();
+                                        }
+                                    },
+                                    Ok(None) => break,
+                                    Err(e) => {
+                                        errors.push(format!("{e:#}"));
+                                        break;
+                                    }
+                                }
                             }
                             feeds.next = (feeds.next + 1) % feeds.items.len();
                         }
                         anyhow::bail!(
-                            "本次未找到未使用的壁纸，已保留当前桌面，请稍后重试或更换分类"
+                            "本次未找到可用的新壁纸，已保留当前桌面。{}",
+                            errors.join("；")
                         )
                     }
                     Command::Configure(_) => unreachable!(),
