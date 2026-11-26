@@ -1,5 +1,6 @@
 use crate::service::{Category, Meta, Page, Wallpaper};
 use anyhow::{Context, Result};
+use rand::Rng;
 use reqwest::blocking::Client;
 use serde_json::Value;
 use std::{
@@ -9,6 +10,7 @@ use std::{
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Source {
+    BingSearch,
     Wallhaven,
     Commons,
     Bing,
@@ -16,6 +18,7 @@ enum Source {
 impl Source {
     fn name(self) -> &'static str {
         match self {
+            Self::BingSearch => "Bing 图片搜索",
             Self::Wallhaven => "Wallhaven",
             Self::Commons => "Wikimedia Commons",
             Self::Bing => "Bing",
@@ -37,6 +40,14 @@ fn request(source: Source, category: Category, page: u32, random: bool) -> Resul
         source.name()
     );
     let result = match source {
+        Source::BingSearch => crate::bing_search::search(
+            category,
+            if random {
+                rand::thread_rng().gen_range(1..=5)
+            } else {
+                page
+            },
+        ),
         Source::Wallhaven => crate::service::wallhaven_search(category, page, random),
         Source::Commons => commons(category, page),
         Source::Bing => bing(page),
@@ -88,7 +99,7 @@ fn merge(results: Vec<Result<Page>>) -> Result<Page> {
     })
 }
 pub fn search(category: Category, page: u32, random: bool) -> Result<Page> {
-    let mut sources = vec![Source::Wallhaven, Source::Commons];
+    let mut sources = vec![Source::BingSearch, Source::Wallhaven, Source::Commons];
     if category == Category::Landscape {
         sources.push(Source::Bing);
     }
@@ -122,10 +133,10 @@ fn client() -> Result<Client> {
 fn commons(category: Category, page: u32) -> Result<Page> {
     let query = match category {
         Category::Beauty => {
-            "woman fashion photograph filetype:bitmap filew:>3840 fileh:>2160 -nude -naked -painting -drawing"
+            "woman fashion photograph filetype:bitmap filew:>2559 fileh:>1439 -nude -naked -painting -drawing"
         }
         Category::Landscape => {
-            "landscape nature filetype:bitmap filew:>3840 fileh:>2160 -map -drawing"
+            "landscape nature filetype:bitmap filew:>2559 fileh:>1439 -map -drawing"
         }
     };
     let value: Value = client()?
@@ -171,7 +182,10 @@ fn parse_commons(value: &Value, page: u32) -> Result<Page> {
             ) else {
                 continue;
             };
-            if width < 3840 || height < 2160 || width > u32::MAX as u64 || height > u32::MAX as u64
+            if width < u64::from(crate::service::MIN_WIDTH)
+                || height < u64::from(crate::service::MIN_HEIGHT)
+                || width > u32::MAX as u64
+                || height > u32::MAX as u64
             {
                 continue;
             }
@@ -231,7 +245,7 @@ fn parse_bing(value: &Value) -> Result<Page> {
         {
             continue;
         }
-        // UHD is only a requested size; the downloaded bytes must still pass real 4K validation.
+        // UHD is only a requested size; the downloaded bytes must still pass real 2K validation.
         data.push(Wallpaper {
             id: format!("bing-{hash}"),
             path: format!("https://www.bing.com{base}_UHD.jpg"),
@@ -276,7 +290,7 @@ mod tests {
         use std::io::Read;
         for category in [Category::Beauty, Category::Landscape] {
             let page = commons(category, 1).unwrap();
-            assert!(!page.data.is_empty(), "Commons returned no 4K images");
+            assert!(!page.data.is_empty(), "Commons returned no 2K images");
             println!(
                 "Commons {:?}: {} verified metadata results",
                 category,
@@ -299,7 +313,7 @@ mod tests {
             .read_to_end(&mut bytes)
             .unwrap();
         crate::service::validate(&bytes).unwrap();
-        println!("Bing UHD download passed image decoding and 4K dimensions check");
+        println!("Bing UHD download passed image decoding and 2K dimensions check");
     }
     #[test]
     fn failed_primary_does_not_discard_backup() {

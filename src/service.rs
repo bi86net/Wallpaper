@@ -6,6 +6,13 @@ use std::{
     time::Duration,
 };
 
+pub const MIN_WIDTH: u32 = 2560;
+pub const MIN_HEIGHT: u32 = 1440;
+pub const MIN_RESOLUTION: &str = "2560x1440";
+pub fn meets_resolution(width: u32, height: u32) -> bool {
+    width >= MIN_WIDTH && height >= MIN_HEIGHT
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub enum Category {
     Beauty,
@@ -71,7 +78,7 @@ pub fn wallhaven_search(category: Category, page: u32, random: bool) -> Result<P
             ("q", q),
             ("categories", categories),
             ("purity", "100"),
-            ("atleast", "3840x2160"),
+            ("atleast", MIN_RESOLUTION),
             ("sorting", if random { "random" } else { "favorites" }),
             ("order", "desc"),
             ("page", &page.to_string()),
@@ -83,7 +90,7 @@ pub fn wallhaven_search(category: Category, page: u32, random: bool) -> Result<P
         .json()?;
     result
         .data
-        .retain(|w| w.dimension_x >= 3840 && w.dimension_y >= 2160);
+        .retain(|w| meets_resolution(w.dimension_x, w.dimension_y));
     Ok(result)
 }
 pub fn download(w: &Wallpaper) -> Result<PathBuf> {
@@ -91,6 +98,9 @@ pub fn download(w: &Wallpaper) -> Result<PathBuf> {
         !w.id.is_empty() && w.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
         "无效的壁纸编号"
     );
+    if w.id.starts_with("bingsearch-") {
+        return download_search_image(w);
+    }
     let url = reqwest::Url::parse(&w.path)?;
     ensure!(allowed_image_url(&url), "无效的图片地址");
     let extension_path = if w.id.starts_with("bing-") {
@@ -135,6 +145,32 @@ pub fn download(w: &Wallpaper) -> Result<PathBuf> {
     save_image(&path, &bytes)?;
     Ok(path)
 }
+fn download_search_image(w: &Wallpaper) -> Result<PathBuf> {
+    let folder = dirs::picture_dir()
+        .or_else(dirs::download_dir)
+        .context("找不到图片目录")?
+        .join("Wallpaper");
+    std::fs::create_dir_all(&folder)?;
+    for ext in ["jpg", "png", "webp"] {
+        let path = folder.join(format!("{}.{}", w.id, ext));
+        if let Ok(bytes) = std::fs::read(&path)
+            && validate(&bytes).is_ok()
+        {
+            return Ok(path);
+        }
+    }
+    let bytes = crate::remote_image::download(&w.path)?;
+    validate(&bytes)?;
+    let ext = match image::guess_format(&bytes)? {
+        image::ImageFormat::Jpeg => "jpg",
+        image::ImageFormat::Png => "png",
+        image::ImageFormat::WebP => "webp",
+        _ => anyhow::bail!("不支持的原图格式"),
+    };
+    let path = folder.join(format!("{}.{}", w.id, ext));
+    save_image(&path, &bytes)?;
+    Ok(path)
+}
 fn save_image(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     let mut temp = tempfile::NamedTempFile::new_in(path.parent().context("无效的图片目录")?)?;
     temp.write_all(bytes)?;
@@ -145,7 +181,10 @@ fn save_image(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
 pub(crate) fn validate(bytes: &[u8]) -> Result<()> {
     let reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
     let (width, height) = reader.into_dimensions().context("下载内容不是有效图片")?;
-    ensure!(width >= 3840 && height >= 2160, "图片实际分辨率不足 4K");
+    ensure!(
+        meets_resolution(width, height),
+        "图片实际分辨率不足 2K（2560×1440）"
+    );
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(256 * 1024 * 1024);
@@ -156,6 +195,18 @@ pub(crate) fn validate(bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn accepts_exact_2k_and_keeps_higher_resolutions() {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(MIN_WIDTH, MIN_HEIGHT)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        assert!(validate(bytes.get_ref()).is_ok());
+        assert!(meets_resolution(3840, 2160));
+        assert!(!meets_resolution(2559, 1440));
+        assert!(!meets_resolution(2560, 1439));
+        assert!(!meets_resolution(1920, 1080));
+    }
     #[test]
     fn only_trusted_source_image_hosts_are_allowed() {
         for url in [

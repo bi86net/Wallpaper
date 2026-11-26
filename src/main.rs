@@ -1,4 +1,6 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+mod bing_search;
+mod remote_image;
 mod rotation;
 mod service;
 mod settings;

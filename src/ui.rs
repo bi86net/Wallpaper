@@ -122,7 +122,7 @@ impl App {
                                 },
                             );
                         });
-                        hint(ui, "4K 壁纸，让桌面焕然一新");
+                        hint(ui, "2K 及以上壁纸，让桌面焕然一新");
                         ui.add_space(4.0);
                         panel().show(ui, |ui| {
                             ui.set_width(ui.available_width());
@@ -310,7 +310,7 @@ impl App {
                             });
                         }
                         ui.horizontal(|ui| {
-                            hint(ui, "Wallhaven · Commons · Bing");
+                            hint(ui, "Bing 搜图 · 多源备用");
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
